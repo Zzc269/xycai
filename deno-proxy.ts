@@ -10,7 +10,7 @@
  *   Base URL: https://你的项目名.deno.dev/v1
  */
 
-const UPSTREAM = Deno.env.get("UPSTREAM_URL") || "https://apicdn.xycai.us";
+const UPSTREAM = Deno.env.get("UPSTREAM_URL") || "https://passion8.cc";
 const TOKEN = Deno.env.get("PROXY_TOKEN") || "";
 const TTL = "1h";
 
