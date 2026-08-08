@@ -11,7 +11,6 @@
  *   PROXY_TOKEN       访问令牌。设了之后请求必须带 x-proxy-token
  *   CACHE_TTL_ON      设为 "0" 临时关闭注入，便于 A/B 对比成本
  *   TAIL_BREAKPOINTS  会话尾部断点数，默认 2
- *   MIN_CACHE_TOKENS  建缓存的最小前缀 token 数，默认 1200；Haiku 档要设 2048
  *   DEBUG             设为 "1" 打印每次请求的断点落点
  */
 
@@ -30,11 +29,10 @@ const TTL = "1h";
 const MAX_BREAKPOINTS = 4;
 
 /**
- * 低于这个 token 数就不插断点：Anthropic 对小于最小 token 数的前缀直接拒绝缓存，
- * 白占一个断点额度。多数模型下限 1024，Haiku 档是 2048，
- * 这里留一点余量，可用 MIN_CACHE_TOKENS 覆盖（Haiku 建议设 2048）。
+ * 低于这个字符数就不插断点：Anthropic 对小于最小 token 数的前缀直接拒绝缓存，
+ * 白占一个断点额度。约 1024 token 折算成中英混排的保守值。
  */
-const MIN_TOKENS = Number(Deno.env.get("MIN_CACHE_TOKENS") ?? "1200");
+const MIN_CHARS = 2000;
 
 /** 1h TTL 必须声明的 beta 特性名。 */
 const BETA_FLAG = "extended-cache-ttl-2025-04-11";
@@ -60,46 +58,22 @@ function cc() {
   return { type: "ephemeral", ttl: TTL };
 }
 
-/**
- * 粗略估算任意结构折算的 token 数。
- * CJK 按 1 字符≈1 token，其余按 4 字符≈1 token，偏保守。
- */
-function tokensOf(v: unknown): number {
+/** 粗略估算可缓存内容体量。 */
+function approxChars(body: Any): number {
   let n = 0;
-  const count = (s: string) => {
-    let cjk = 0;
-    for (const ch of s) {
-      const c = ch.codePointAt(0)!;
-      if (
-        (c >= 0x3040 && c <= 0x30ff) ||
-        (c >= 0x3400 && c <= 0x4dbf) ||
-        (c >= 0x4e00 && c <= 0x9fff) ||
-        (c >= 0xf900 && c <= 0xfaff) ||
-        (c >= 0xac00 && c <= 0xd7af) ||
-        (c >= 0x20000 && c <= 0x2ebef)
-      ) {
-        cjk++;
-      }
-    }
-    const rest = s.length - cjk;
-    n += cjk + Math.ceil(rest / 4);
-  };
-  const walk = (x: unknown) => {
-    if (typeof x === "string") {
-      count(x);
-    } else if (Array.isArray(x)) {
-      for (const y of x) walk(y);
-    } else if (isObj(x)) {
-      for (const y of Object.values(x)) walk(y);
+  const walk = (v: unknown) => {
+    if (typeof v === "string") {
+      n += v.length;
+    } else if (Array.isArray(v)) {
+      for (const x of v) walk(x);
+    } else if (isObj(v)) {
+      for (const x of Object.values(v)) walk(x);
     }
   };
-  walk(v);
+  walk(body?.system);
+  walk(body?.messages);
+  walk(body?.tools);
   return n;
-}
-
-/** 粗略估算可缓存内容总体量（token）。 */
-function approxTokens(body: Any): number {
-  return tokensOf(body?.tools) + tokensOf(body?.system) + tokensOf(body?.messages);
 }
 
 /** 收集已存在的 cache_control 宿主对象。 */
@@ -165,9 +139,9 @@ function injectAnthropic(body: Any, tailBreakpoints = 2): InjectResult {
   }
   if (holders.length > 0) applied.push(`upgraded:${holders.length}`);
 
-  const total = approxTokens(body);
-  if (total < MIN_TOKENS) {
-    return { changed, applied, skipped: `too-small:${total}<${MIN_TOKENS}tok` };
+  const chars = approxChars(body);
+  if (chars < MIN_CHARS) {
+    return { changed, applied, skipped: `too-small:${chars}<${MIN_CHARS}` };
   }
 
   let budget = MAX_BREAKPOINTS - holders.length;
@@ -180,42 +154,21 @@ function injectAnthropic(body: Any, tailBreakpoints = 2): InjectResult {
     changed = true;
   };
 
-  // 缓存前缀长度按“断点之前的累计内容”算，而不是整个请求体。
-  // 断点之后的内容再长也不算进这个前缀，短前缀会被上游直接拒绝缓存。
-  const toolsTokens = tokensOf(body.tools);
-  const systemTokens = tokensOf(body.system);
-
   if (budget > 0 && Array.isArray(body.tools) && body.tools.length > 0) {
     const last = body.tools.filter(isObj).at(-1);
-    if (last && !isObj(last.cache_control)) {
-      if (toolsTokens >= MIN_TOKENS) mark(last, "tools");
-      else applied.push(`skip-tools:${toolsTokens}tok`);
-    }
+    if (last && !isObj(last.cache_control)) mark(last, "tools");
   }
 
   if (budget > 0 && body.system !== undefined) {
     const blocks = toBlocks(body.system);
     const target = blocks && lastCacheable(blocks);
     if (blocks && target && !isObj(target.cache_control)) {
-      const prefix = toolsTokens + systemTokens;
-      if (prefix >= MIN_TOKENS) {
-        body.system = blocks;
-        mark(target, "system");
-      } else {
-        applied.push(`skip-system:${prefix}tok`);
-      }
+      body.system = blocks;
+      mark(target, "system");
     }
   }
 
   if (budget > 0 && tailBreakpoints > 0 && Array.isArray(body.messages)) {
-    // 每条消息之前的累计前缀长度，用于判断该断点是否够长。
-    const prefixAt: number[] = [];
-    let acc = toolsTokens + systemTokens;
-    for (const msg of body.messages) {
-      acc += tokensOf(msg);
-      prefixAt.push(acc);
-    }
-
     let placed = 0;
     for (
       let i = body.messages.length - 1;
@@ -224,7 +177,6 @@ function injectAnthropic(body: Any, tailBreakpoints = 2): InjectResult {
     ) {
       const msg = body.messages[i];
       if (!isObj(msg)) continue;
-      if (prefixAt[i] < MIN_TOKENS) break;
       const blocks = toBlocks(msg.content);
       const target = blocks && lastCacheable(blocks);
       if (!blocks || !target || isObj(target.cache_control)) continue;
@@ -255,9 +207,9 @@ function injectOpenAI(body: Any): InjectResult {
   }
   if (holders.length > 0) applied.push(`upgraded:${holders.length}`);
 
-  const total = approxTokens(body);
-  if (total < MIN_TOKENS) {
-    return { changed, applied, skipped: `too-small:${total}<${MIN_TOKENS}tok` };
+  const chars = approxChars(body);
+  if (chars < MIN_CHARS) {
+    return { changed, applied, skipped: `too-small:${chars}<${MIN_CHARS}` };
   }
   if (!Array.isArray(body.messages)) return { changed, applied, skipped: "no-messages" };
 
@@ -278,28 +230,6 @@ function injectOpenAI(body: Any): InjectResult {
   }
 
   return { changed, applied };
-}
-
-/** 请求体里是否真的存在 ttl=1h 的断点。 */
-function hasOneHourCache(body: Any): boolean {
-  let found = false;
-  const walk = (v: unknown) => {
-    if (found) return;
-    if (Array.isArray(v)) {
-      for (const x of v) walk(x);
-      return;
-    }
-    if (!isObj(v)) return;
-    if (isObj(v.cache_control) && v.cache_control.ttl === TTL) {
-      found = true;
-      return;
-    }
-    for (const x of Object.values(v)) walk(x);
-  };
-  walk(body?.system);
-  walk(body?.messages);
-  walk(body?.tools);
-  return found;
 }
 
 /** 保留客户端已有的 beta 特性，追加 1h TTL 所需的那一个，不重复。 */
@@ -433,7 +363,6 @@ export async function handler(req: Request): Promise<Response> {
       ttl: TTL,
       injection: ENABLED ? "on" : "off",
       tailBreakpoints: TAIL,
-      minCacheTokens: MIN_TOKENS,
     });
   }
 
@@ -463,16 +392,10 @@ export async function handler(req: Request): Promise<Response> {
   if (ENABLED) {
     const result = isMessagesPath(path) ? injectAnthropic(body, TAIL) : injectOpenAI(body);
     note = result.skipped ? `skipped(${result.skipped})` : `applied[${result.applied.join(" ")}]`;
-  }
-
-  // 1h TTL 必须声明 beta，否则 ttl 被忽略、按默认 5 分钟计。
-  // 只要请求体里存在 ttl=1h 的断点就必须带上，不能只在本代理改写过时才带：
-  // 客户端自己已经标好 1h 的情况下注入结果是「无改动」，那时同样需要这个头。
-  if (isMessagesPath(path) && hasOneHourCache(body)) {
-    headers.set("anthropic-beta", mergeBetaHeader(headers.get("anthropic-beta")));
-    note += ` beta[${headers.get("anthropic-beta")}]`;
-  } else if (isMessagesPath(path)) {
-    note += " beta[none]";
+    // 1h TTL 必须声明 beta；仅 Anthropic 原生路径需要。
+    if (result.changed && isMessagesPath(path)) {
+      headers.set("anthropic-beta", mergeBetaHeader(headers.get("anthropic-beta")));
+    }
   }
 
   headers.set("content-type", "application/json");
