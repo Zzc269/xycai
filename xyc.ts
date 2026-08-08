@@ -1,43 +1,44 @@
 /**
- * xyc 中转站 · 1h 提示词缓存注入代理（Deno Deploy Playground 单文件版）
+ * xyc 涓浆绔� 路 1h 鎻愮ず璇嶇紦瀛樻敞鍏ヤ唬鐞嗭紙Deno Deploy Playground 鍗曟枃浠剁増锛�
  *
- * 上游：https://apicdn.xycai.us  （地址不带 /v1，客户端路径原样转发）
+ * 涓婃父锛歨ttps://apicdn.xycai.us  锛堝湴鍧€涓嶅甫 /v1锛屽鎴风璺緞鍘熸牱杞彂锛�
  *
- * 用法：新建一个 Playground，把这个文件整体粘贴进去，保存即部署。
- * LobeHub 的 Anthropic Base URL 填 https://你的项目名.deno.dev （后面不要再加 /v1）
+ * 鐢ㄦ硶锛氭柊寤轰竴涓� Playground锛屾妸杩欎釜鏂囦欢鏁翠綋绮樿创杩涘幓锛屼繚瀛樺嵆閮ㄧ讲銆�
+ * LobeHub 鐨� Anthropic Base URL 濉� https://浣犵殑椤圭洰鍚�.deno.dev 锛堝悗闈笉瑕佸啀鍔� /v1锛�
  *
- * 可选环境变量（Playground 的 Settings 里加，不设也能跑）：
- *   UPSTREAM_URL      覆盖上游地址
- *   PROXY_TOKEN       访问令牌。设了之后请求必须带 x-proxy-token
- *   CACHE_TTL_ON      设为 "0" 临时关闭注入，便于 A/B 对比成本
- *   TAIL_BREAKPOINTS  会话尾部断点数，默认 2
- *   DEBUG             设为 "1" 打印每次请求的断点落点
+ * 鍙€夌幆澧冨彉閲忥紙Playground 鐨� Settings 閲屽姞锛屼笉璁句篃鑳借窇锛夛細
+ *   UPSTREAM_URL      瑕嗙洊涓婃父鍦板潃
+ *   PROXY_TOKEN       璁块棶浠ょ墝銆傝浜嗕箣鍚庤姹傚繀椤诲甫 x-proxy-token
+ *   CACHE_TTL_ON      璁句负 "0" 涓存椂鍏抽棴娉ㄥ叆锛屼究浜� A/B 瀵规瘮鎴愭湰
+ *   TAIL_BREAKPOINTS  浼氳瘽灏鹃儴鏂偣鏁帮紝榛樿 2
+ *   MIN_CACHE_TOKENS  寤虹紦瀛樼殑鏈€灏忓墠缂€ token 鏁帮紝榛樿 1200锛圚aiku 妗ｉ渶璁� 2048锛�
+ *   DEBUG             璁句负 "1" 鎵撳嵃鏂偣钀界偣銆乥eta 澶淬€佷互鍙� system 鎸囩汗
  */
 
-// ==================== 只有这一段与 passion8 版本不同 ====================
+// ==================== 鍙湁杩欎竴娈典笌 passion8 鐗堟湰涓嶅悓 ====================
 
 const PROVIDER = "xyc";
 const DEFAULT_UPSTREAM = "https://apicdn.xycai.us";
-/** 上游地址是否已经包含 /v1 前缀。xyc 不含，所以是 false。 */
+/** 涓婃父鍦板潃鏄惁宸茬粡鍖呭惈 /v1 鍓嶇紑銆倄yc 涓嶅惈锛屾墍浠ユ槸 false銆� */
 const UPSTREAM_HAS_V1 = false;
 
 // ======================================================================
 
 const TTL = "1h";
 
-/** Anthropic 单请求最多 4 个 cache 断点。 */
+/** Anthropic 鍗曡姹傛渶澶� 4 涓� cache 鏂偣銆� */
 const MAX_BREAKPOINTS = 4;
 
 /**
- * 低于这个字符数就不插断点：Anthropic 对小于最小 token 数的前缀直接拒绝缓存，
- * 白占一个断点额度。约 1024 token 折算成中英混排的保守值。
+ * 浣庝簬杩欎釜 token 鏁板氨涓嶆彃鏂偣锛欰nthropic 瀵瑰皬浜庢渶灏� token 鏁扮殑鍓嶇紑鐩存帴鎷掔粷缂撳瓨锛�
+ * 鐧藉崰涓€涓柇鐐归搴︺€係onnet/Opus 涓嬮檺 1024锛孒aiku 涓嬮檺 2048銆�
  */
-const MIN_CHARS = 2000;
+const MIN_TOKENS = Number(Deno.env.get("MIN_CACHE_TOKENS") ?? "1200");
 
-/** 1h TTL 必须声明的 beta 特性名。 */
+/** 1h TTL 蹇呴』澹版槑鐨� beta 鐗规€у悕銆� */
 const BETA_FLAG = "extended-cache-ttl-2025-04-11";
 
-/** 接受 cache_control 的块类型；thinking 块不接受。 */
+/** 鎺ュ彈 cache_control 鐨勫潡绫诲瀷锛泃hinking 鍧椾笉鎺ュ彈銆� */
 const CACHEABLE_TYPES = new Set([
   "text",
   "image",
@@ -58,25 +59,37 @@ function cc() {
   return { type: "ephemeral", ttl: TTL };
 }
 
-/** 粗略估算可缓存内容体量。 */
-function approxChars(body: Any): number {
-  let n = 0;
-  const walk = (v: unknown) => {
-    if (typeof v === "string") {
-      n += v.length;
-    } else if (Array.isArray(v)) {
-      for (const x of v) walk(x);
-    } else if (isObj(v)) {
-      for (const x of Object.values(v)) walk(x);
+/**
+ * 绮楃暐浼扮畻 token 鏁般€侰JK 涓€瀛楃害涓€ token锛屽叾浣欐寜鍥涘瓧绗︿竴 token銆�
+ * 鍙敤浜庡拰鏈€灏忕紦瀛橀暱搴︽瘮杈冿紝涓嶉渶瑕佺簿纭€�
+ */
+function approxTokens(v: unknown): number {
+  let cjk = 0;
+  let other = 0;
+  const walk = (x: unknown) => {
+    if (typeof x === "string") {
+      for (const ch of x) {
+        const c = ch.codePointAt(0)!;
+        if (c > 0x2e80) cjk++;
+        else other++;
+      }
+    } else if (Array.isArray(x)) {
+      for (const y of x) walk(y);
+    } else if (isObj(x)) {
+      for (const y of Object.values(x)) walk(y);
     }
   };
-  walk(body?.system);
-  walk(body?.messages);
-  walk(body?.tools);
-  return n;
+  walk(v);
+  return cjk + Math.ceil(other / 4);
 }
 
-/** 收集已存在的 cache_control 宿主对象。 */
+/** 鏁翠釜璇锋眰浣撶殑鍙紦瀛樺唴瀹逛綋閲忥紝鐢ㄤ簬銆屽お灏忓氨鏁翠綋璺宠繃銆嶇殑蹇€熷垽鏂€� */
+function totalTokens(body: Any): number {
+  return approxTokens(body?.system) + approxTokens(body?.tools) +
+    approxTokens(body?.messages);
+}
+
+/** 鏀堕泦宸插瓨鍦ㄧ殑 cache_control 瀹夸富瀵硅薄銆� */
 function existingHolders(body: Any): Record<string, Any>[] {
   const out: Record<string, Any>[] = [];
   const walk = (v: unknown) => {
@@ -94,7 +107,7 @@ function existingHolders(body: Any): Record<string, Any>[] {
   return out;
 }
 
-/** 字符串内容规范成块数组，便于挂断点。 */
+/** 瀛楃涓插唴瀹硅鑼冩垚鍧楁暟缁勶紝渚夸簬鎸傛柇鐐广€� */
 function toBlocks(v: unknown): Record<string, Any>[] | null {
   if (typeof v === "string") {
     return v.trim() === "" ? null : [{ type: "text", text: v }];
@@ -116,20 +129,20 @@ function lastCacheable(blocks: Record<string, Any>[]): Record<string, Any> | nul
 
 interface InjectResult {
   changed: boolean;
-  /** 断点落点说明，用于日志。 */
+  /** 鏂偣钀界偣璇存槑锛岀敤浜庢棩蹇椼€� */
   applied: string[];
   skipped?: string;
 }
 
 /**
- * 原地注入 Anthropic /v1/messages 断点。
- * 顺序按前缀稳定度：tools -> system -> 会话尾部。
+ * 鍘熷湴娉ㄥ叆 Anthropic /v1/messages 鏂偣銆�
+ * 椤哄簭鎸夊墠缂€绋冲畾搴︼細tools -> system -> 浼氳瘽灏鹃儴銆�
  */
 function injectAnthropic(body: Any, tailBreakpoints = 2): InjectResult {
   const applied: string[] = [];
   let changed = false;
 
-  // 客户端已带的断点：改写成 1h，而不是另开一个断点浪费额度。
+  // 瀹㈡埛绔凡甯︾殑鏂偣锛氭敼鍐欐垚 1h锛岃€屼笉鏄彟寮€涓€涓柇鐐规氮璐归搴︺€�
   const holders = existingHolders(body);
   for (const h of holders) {
     if (h.cache_control.ttl !== TTL) {
@@ -139,9 +152,9 @@ function injectAnthropic(body: Any, tailBreakpoints = 2): InjectResult {
   }
   if (holders.length > 0) applied.push(`upgraded:${holders.length}`);
 
-  const chars = approxChars(body);
-  if (chars < MIN_CHARS) {
-    return { changed, applied, skipped: `too-small:${chars}<${MIN_CHARS}` };
+  const total = totalTokens(body);
+  if (total < MIN_TOKENS) {
+    return { changed, applied, skipped: `too-small:${total}<${MIN_TOKENS}tok` };
   }
 
   let budget = MAX_BREAKPOINTS - holders.length;
@@ -154,28 +167,55 @@ function injectAnthropic(body: Any, tailBreakpoints = 2): InjectResult {
     changed = true;
   };
 
+  // 缂撳瓨鍓嶇紑鏄€屾柇鐐逛箣鍓嶇殑绱鍐呭銆嶏紝鏂偣涔嬪悗鐨勫唴瀹瑰啀澶氫篃涓嶇畻銆�
+  // 鎵€浠ユ瘡涓€欓€変綅缃兘瑕佹寜瀹冭嚜宸辩殑鍓嶇紑闀垮害鍒ゆ柇锛屼笉鑳界敤璇锋眰浣撴€婚噺銆�
+  const toolsTok = approxTokens(body?.tools);
+  const systemTok = approxTokens(body?.system);
+
   if (budget > 0 && Array.isArray(body.tools) && body.tools.length > 0) {
     const last = body.tools.filter(isObj).at(-1);
-    if (last && !isObj(last.cache_control)) mark(last, "tools");
+    if (last && !isObj(last.cache_control)) {
+      if (toolsTok >= MIN_TOKENS) mark(last, "tools");
+      else applied.push(`skip-tools:${toolsTok}tok`);
+    }
   }
 
   if (budget > 0 && body.system !== undefined) {
     const blocks = toBlocks(body.system);
     const target = blocks && lastCacheable(blocks);
     if (blocks && target && !isObj(target.cache_control)) {
-      body.system = blocks;
-      mark(target, "system");
+      const prefix = toolsTok + systemTok;
+      if (prefix >= MIN_TOKENS) {
+        body.system = blocks;
+        mark(target, "system");
+      } else {
+        applied.push(`skip-system:${prefix}tok`);
+      }
     }
   }
 
   if (budget > 0 && tailBreakpoints > 0 && Array.isArray(body.messages)) {
+    // 绗� i 鏉℃秷鎭笂鐨勬柇鐐癸紝鍏跺墠缂€鏄� tools + system + messages[0..i]銆�
+    const msgs = body.messages as Any[];
+    const cum: number[] = [];
+    let run = toolsTok + systemTok;
+    for (const m of msgs) {
+      run += approxTokens(m);
+      cum.push(run);
+    }
+
     let placed = 0;
     for (
-      let i = body.messages.length - 1;
+      let i = msgs.length - 1;
       i >= 0 && placed < tailBreakpoints && budget > 0;
       i--
     ) {
-      const msg = body.messages[i];
+      // 寰€鍓嶈蛋鍓嶇紑鍙細鏇寸煭锛岃繖閲屼笉澶熼暱灏辨病蹇呰缁х画浜嗐€�
+      if (cum[i] < MIN_TOKENS) {
+        applied.push(`skip-msgs:${cum[i]}tok`);
+        break;
+      }
+      const msg = msgs[i];
       if (!isObj(msg)) continue;
       const blocks = toBlocks(msg.content);
       const target = blocks && lastCacheable(blocks);
@@ -190,9 +230,9 @@ function injectAnthropic(body: Any, tailBreakpoints = 2): InjectResult {
 }
 
 /**
- * OpenAI 兼容通道（/v1/chat/completions）。
- * 中转站对该路径的 cache_control 支持不一致，这里只做保守处理：
- * 给 system 消息挂断点，并补齐已有断点的 ttl。
+ * OpenAI 鍏煎閫氶亾锛�/v1/chat/completions锛夈€�
+ * 涓浆绔欏璇ヨ矾寰勭殑 cache_control 鏀寔涓嶄竴鑷达紝杩欓噷鍙仛淇濆畧澶勭悊锛�
+ * 缁� system 娑堟伅鎸傛柇鐐癸紝骞惰ˉ榻愬凡鏈夋柇鐐圭殑 ttl銆�
  */
 function injectOpenAI(body: Any): InjectResult {
   const applied: string[] = [];
@@ -207,9 +247,9 @@ function injectOpenAI(body: Any): InjectResult {
   }
   if (holders.length > 0) applied.push(`upgraded:${holders.length}`);
 
-  const chars = approxChars(body);
-  if (chars < MIN_CHARS) {
-    return { changed, applied, skipped: `too-small:${chars}<${MIN_CHARS}` };
+  const total = totalTokens(body);
+  if (total < MIN_TOKENS) {
+    return { changed, applied, skipped: `too-small:${total}<${MIN_TOKENS}tok` };
   }
   if (!Array.isArray(body.messages)) return { changed, applied, skipped: "no-messages" };
 
@@ -232,7 +272,43 @@ function injectOpenAI(body: Any): InjectResult {
   return { changed, applied };
 }
 
-/** 保留客户端已有的 beta 特性，追加 1h TTL 所需的那一个，不重复。 */
+/** 璇锋眰浣撻噷鏄惁鐪熺殑瀛樺湪 ttl=1h 鐨勬柇鐐广€俠eta 澶磋鎸夎繖涓垽鏂紝鑰屼笉鏄湅鏈夋病鏈夋敼鍐欒繃銆� */
+function hasOneHourCache(body: Any): boolean {
+  let found = false;
+  const walk = (v: unknown) => {
+    if (found) return;
+    if (Array.isArray(v)) {
+      for (const x of v) walk(x);
+      return;
+    }
+    if (!isObj(v)) return;
+    if (isObj(v.cache_control) && v.cache_control.ttl === TTL) {
+      found = true;
+      return;
+    }
+    for (const x of Object.values(v)) walk(x);
+  };
+  walk(body?.system);
+  walk(body?.messages);
+  walk(body?.tools);
+  return found;
+}
+
+/**
+ * 缁� system 鍙栨寚绾广€傚墠缂€姣忚疆鍙樺寲锛堟敞鍏ユ椂闂存埑銆佷細璇濇爣棰樼瓑锛変細璁╃紦瀛樻案杩滀笉鍛戒腑锛�
+ * 杩欎釜鎸囩汗鐢ㄦ潵鎶娿€屽墠缂€婕傜Щ銆嶅拰銆屾柇鐐规病鎵撲笂銆嶄袱绉嶆儏鍐靛尯鍒嗗紑銆�
+ */
+function systemFingerprint(body: Any): string {
+  const s = typeof body?.system === "string"
+    ? body.system
+    : JSON.stringify(body?.system ?? null);
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  const hash = (h >>> 0).toString(16).padStart(8, "0");
+  return `len=${s.length} hash=${hash} head=${JSON.stringify(s.slice(0, 160))}`;
+}
+
+/** 淇濈暀瀹㈡埛绔凡鏈夌殑 beta 鐗规€э紝杩藉姞 1h TTL 鎵€闇€鐨勯偅涓€涓紝涓嶉噸澶嶃€� */
 function mergeBetaHeader(current: string | null): string {
   const parts = (current ?? "")
     .split(",")
@@ -250,7 +326,7 @@ const CORS_HEADERS: Record<string, string> = {
   "access-control-max-age": "86400",
 };
 
-/** 不能原样转发给上游的逐跳头/长度头。 */
+/** 涓嶈兘鍘熸牱杞彂缁欎笂娓哥殑閫愯烦澶�/闀垮害澶淬€� */
 const STRIP_HEADERS = [
   "host",
   "connection",
@@ -279,7 +355,7 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
-/** 恒定时间比较，避免令牌被逐字符试探。 */
+/** 鎭掑畾鏃堕棿姣旇緝锛岄伩鍏嶄护鐗岃閫愬瓧绗﹁瘯鎺€€� */
 function safeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
   let diff = 0;
@@ -287,7 +363,7 @@ function safeEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
-/** 去掉末尾斜杠；根路径归一为 "/"。 */
+/** 鍘绘帀鏈熬鏂滄潬锛涙牴璺緞褰掍竴涓� "/"銆� */
 function normalizePath(pathname: string): string {
   return pathname.replace(/\/+$/, "") || "/";
 }
@@ -301,8 +377,8 @@ function isChatPath(path: string): boolean {
 }
 
 /**
- * 拼接上游 URL。上游地址自带 /v1 且客户端也发了 /v1 时去掉一层，
- * 避免出现 /v1/v1/messages。
+ * 鎷兼帴涓婃父 URL銆備笂娓稿湴鍧€鑷甫 /v1 涓斿鎴风涔熷彂浜� /v1 鏃跺幓鎺変竴灞傦紝
+ * 閬垮厤鍑虹幇 /v1/v1/messages銆�
  */
 function resolveUpstream(path: string): string {
   if (!UPSTREAM_HAS_V1) return UPSTREAM + path;
@@ -322,7 +398,7 @@ async function forward(
       method,
       headers,
       body,
-      // 透传原始请求体流时必须声明 duplex。
+      // 閫忎紶鍘熷璇锋眰浣撴祦鏃跺繀椤诲０鏄� duplex銆�
       ...(body !== null && typeof body === "object" ? { duplex: "half" } : {}),
     } as RequestInit);
 
@@ -330,7 +406,7 @@ async function forward(
       console.log(`[${PROVIDER}] ${method} ${path} -> ${upstream.status} | ttl=${TTL} | ${note}`);
     }
 
-    // 保留上游响应头，去掉会破坏流式传输和已解码内容的那几个。
+    // 淇濈暀涓婃父鍝嶅簲澶达紝鍘绘帀浼氱牬鍧忔祦寮忎紶杈撳拰宸茶В鐮佸唴瀹圭殑閭ｅ嚑涓€�
     const out = new Headers(upstream.headers);
     out.delete("content-encoding");
     out.delete("content-length");
@@ -363,6 +439,7 @@ export async function handler(req: Request): Promise<Response> {
       ttl: TTL,
       injection: ENABLED ? "on" : "off",
       tailBreakpoints: TAIL,
+      minCacheTokens: MIN_TOKENS,
     });
   }
 
@@ -375,7 +452,7 @@ export async function handler(req: Request): Promise<Response> {
   const headers = new Headers(req.headers);
   for (const h of STRIP_HEADERS) headers.delete(h);
 
-  // 非 JSON 请求体的路径（如 /v1/models）原样透传，不解析不改写。
+  // 闈� JSON 璇锋眰浣撶殑璺緞锛堝 /v1/models锛夊師鏍烽€忎紶锛屼笉瑙ｆ瀽涓嶆敼鍐欍€�
   const cacheable = req.method === "POST" && (isMessagesPath(path) || isChatPath(path));
   if (!cacheable) {
     return await forward(req.method, target, headers, req.body, path, "passthrough");
@@ -388,13 +465,26 @@ export async function handler(req: Request): Promise<Response> {
     return json({ error: "bad json body" }, 400);
   }
 
+  // 娉ㄥ叆鍓嶅厛璁版寚绾癸細鍛戒腑澶辫触鏃剁敤鏉ュ垽鏂槸涓嶆槸鍓嶇紑姣忚疆閮藉湪鍙樸€�
+  if (DEBUG && isMessagesPath(path)) {
+    console.log(`[${PROVIDER}] system ${systemFingerprint(body)}`);
+  }
+
   let note = "off";
   if (ENABLED) {
     const result = isMessagesPath(path) ? injectAnthropic(body, TAIL) : injectOpenAI(body);
     note = result.skipped ? `skipped(${result.skipped})` : `applied[${result.applied.join(" ")}]`;
-    // 1h TTL 必须声明 beta；仅 Anthropic 原生路径需要。
-    if (result.changed && isMessagesPath(path)) {
+  }
+
+  // 1h TTL 蹇呴』澹版槑 beta锛屽惁鍒� ttl 琚拷鐣ャ€佹寜榛樿 5 鍒嗛挓璁¤垂銆�
+  // 鍒ゆ柇渚濇嵁鏄姹備綋閲屾湁娌℃湁 1h 鏂偣锛岃€屼笉鏄湰浠ｇ悊鏈夋病鏈夋敼鍐欒繃锛�
+  // 瀹㈡埛绔嚜宸卞凡缁忔爣濂� 1h 鏃舵敞鍏ョ粨鏋滄槸銆屾棤鏀瑰姩銆嶏紝閭ｆ椂鍚屾牱闇€瑕佽繖涓ご銆�
+  if (isMessagesPath(path)) {
+    if (hasOneHourCache(body)) {
       headers.set("anthropic-beta", mergeBetaHeader(headers.get("anthropic-beta")));
+      note += ` beta[${headers.get("anthropic-beta")}]`;
+    } else {
+      note += " beta[none]";
     }
   }
 
