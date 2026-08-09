@@ -6,7 +6,8 @@
  *   https://你的项目名.deno.dev
  *
  * 默认行为：
- *   1. tools、system、最近两条消息最多使用 4 个 1h cache breakpoint
+ *   1. 默认删除 LobeHub 自带的 5m 断点，只在最新消息放 1 个 1h 断点
+ *      （该断点会缓存它之前的 tools、system 和全部消息）
  *   2. 在最后一条 user 消息的缓存断点之后追加当前时间（时间块本身不缓存）
  *   3. 每个入站请求只向 xyc 发起 1 次请求，绝不自动重试
  *   4. /logs 显示断点、缓存 usage、失败原文和请求编号
@@ -15,6 +16,7 @@
  *   UPSTREAM_URL        默认 https://apicdn.xycai.us
  *   PROXY_TOKEN         可选访问令牌；设置后请求需带 x-proxy-token
  *   CACHE_TTL_ON        "0" = 不改缓存；默认开启
+ *   BREAKPOINT_MODE     "message"（默认，单 message 断点）| "all"（最多 4 断点）
  *   TAIL_BREAKPOINTS    最近消息断点数；默认 2，建议 1~2
  *   INJECT_CURRENT_TIME "0" = 不注入当前时间；默认开启
  *   TIME_ZONE           默认 Asia/Shanghai
@@ -35,6 +37,7 @@ type Any = any;
 const UPSTREAM = (Deno.env.get("UPSTREAM_URL") || DEFAULT_UPSTREAM).replace(/\/+$/, "");
 const PROXY_TOKEN = Deno.env.get("PROXY_TOKEN") || "";
 const CACHE_ENABLED = Deno.env.get("CACHE_TTL_ON") !== "0";
+const BREAKPOINT_MODE = (Deno.env.get("BREAKPOINT_MODE") || "message").toLowerCase();
 const TIME_ENABLED = Deno.env.get("INJECT_CURRENT_TIME") !== "0";
 const TIME_ZONE = Deno.env.get("TIME_ZONE") || "Asia/Shanghai";
 const DEBUG = Deno.env.get("DEBUG") === "1";
@@ -248,10 +251,47 @@ interface InjectResult {
 }
 
 /**
- * 全缓存模式：保留 LobeHub 的已有断点并全部升级成 1h，
+ * 单 message 断点模式。
+ * 先移除 LobeHub 自带的 5m 断点，避免旧 5m 父缓存和新 1h 增量混用；
+ * 再把唯一的 1h 断点放到最新消息的最后一个可缓存块。
+ */
+function injectAnthropicMessage(body: Any): InjectResult {
+  const holders = existingHolders(body);
+  for (const holder of holders) delete holder.cache_control;
+
+  const applied: string[] = [];
+  let changed = holders.length > 0;
+  if (holders.length > 0) applied.push(`removed:${holders.length}`);
+
+  const chars = approxChars(body);
+  if (chars < MIN_CHARS) {
+    return { changed, applied, skipped: `too-small:${chars}<${MIN_CHARS}` };
+  }
+  if (!Array.isArray(body?.messages) || body.messages.length === 0) {
+    return { changed, applied, skipped: "no-messages" };
+  }
+
+  for (let i = body.messages.length - 1; i >= 0; i--) {
+    const msg = body.messages[i];
+    if (!isObj(msg)) continue;
+    const blocks = toBlocks(msg.content);
+    const target = blocks && lastCacheable(blocks);
+    if (!blocks || !target) continue;
+    msg.content = blocks;
+    target.cache_control = cc();
+    applied.push(`msg[${i}]:${msg.role ?? "?"}`);
+    changed = true;
+    return { changed, applied };
+  }
+
+  return { changed, applied, skipped: "no-cacheable-message-block" };
+}
+
+/**
+ * 多断点兼容模式：保留 LobeHub 的已有断点并全部升级成 1h，
  * 再按 tools -> system -> 最近消息补足，最多 4 个。
  */
-function injectAnthropic(body: Any, tailBreakpoints: number): InjectResult {
+function injectAnthropicAll(body: Any, tailBreakpoints: number): InjectResult {
   const applied: string[] = [];
   let changed = false;
 
@@ -556,7 +596,7 @@ async function handler(req: Request): Promise<Response> {
       ok: true,
       provider: PROVIDER,
       upstream: UPSTREAM,
-      cache: CACHE_ENABLED ? `${TTL}/all` : "passthrough",
+      cache: CACHE_ENABLED ? `${TTL}/${BREAKPOINT_MODE}` : "passthrough",
       beta: CACHE_ENABLED ? BETA_FLAG : "not-added",
       tailBreakpoints: TAIL_BREAKPOINTS,
       currentTimeInjection: TIME_ENABLED,
@@ -617,7 +657,9 @@ async function handler(req: Request): Promise<Response> {
   let cacheNote = "off";
   if (CACHE_ENABLED) {
     const result = isMessagesPath(path)
-      ? injectAnthropic(body, TAIL_BREAKPOINTS)
+      ? (BREAKPOINT_MODE === "all"
+        ? injectAnthropicAll(body, TAIL_BREAKPOINTS)
+        : injectAnthropicMessage(body))
       : injectOpenAI(body);
     cacheNote = result.skipped
       ? `skipped(${result.skipped}) applied[${result.applied.join(" ")}]`
