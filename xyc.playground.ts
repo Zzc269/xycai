@@ -119,25 +119,26 @@ function resolveUpstream(path: string): string {
   return UPSTREAM + path;
 }
 
-function formatTime(date = new Date()): string {
+function formatTime(date = new Date(), includeSeconds = false): string {
   try {
-    return new Intl.DateTimeFormat("sv-SE", {
+    const options: Intl.DateTimeFormatOptions = {
       timeZone: TIME_ZONE,
       year: "numeric",
       month: "2-digit",
       day: "2-digit",
       hour: "2-digit",
       minute: "2-digit",
-      second: "2-digit",
       hourCycle: "h23",
-    }).format(date);
+    };
+    if (includeSeconds) options.second = "2-digit";
+    return new Intl.DateTimeFormat("sv-SE", options).format(date);
   } catch {
     return date.toISOString();
   }
 }
 
 function clock(): string {
-  return formatTime().replace("T", " ");
+  return formatTime(new Date(), true).replace("T", " ");
 }
 
 function record(line: string, forceConsole = false): void {
@@ -385,7 +386,6 @@ function appendCurrentTime(body: Any): { added: boolean; reason?: string } {
       `<runtime_context source="request_proxy">\n` +
       `当前时间：${formatTime(now)}\n` +
       `时区：${TIME_ZONE}\n` +
-      `Unix 毫秒：${now.getTime()}\n` +
       `这是代理自动加入的运行时信息，不是用户原文。` +
       `仅在问题涉及现在、今天、日期、时限或相对时间时使用。\n` +
       `</runtime_context>`,
