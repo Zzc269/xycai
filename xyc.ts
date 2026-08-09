@@ -1,10 +1,11 @@
-// xyc 1h 缓存注入代理 · 带 /logs 网页查看
-// Runtime configuration: Dynamic App
-// 不需要设置任何环境变量
+// xyc 1h 缓存注入代理 · 最终诊断版
+// Zeabur / Deno Deploy 通用，不需要设置任何环境变量
+// 查看日志：https://你的域名/logs
 
 const UPSTREAM = "https://apicdn.xycai.us";
 const TTL = "1h";
 const BETA = "extended-cache-ttl-2025-04-11";
+const PORT = Number(Deno.env.get("PORT") ?? "8000");
 
 const STRIP = [
   "host",
@@ -18,49 +19,127 @@ const STRIP = [
 let seq = 0;
 const LINES: string[] = [];
 
+// 保存上一次请求的内容，用来对比出到底哪里变了
+let prevSys = "";
+let prevTools = "";
+
 function record(line: string) {
   LINES.push(line);
-  if (LINES.length > 200) LINES.shift();
+  if (LINES.length > 300) LINES.shift();
   console.log(line);
 }
 
+function str(v: unknown): string {
+  return typeof v === "string" ? v : JSON.stringify(v ?? null);
+}
+
 function hash(v: unknown): string {
-  const s = typeof v === "string" ? v : JSON.stringify(v ?? null);
+  const s = str(v);
   let h = 5381;
   for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
   return (h >>> 0).toString(16).padStart(8, "0") + "/" + s.length;
+}
+
+/** 把所有数字换成 0 再取哈希：如果这个稳定而原始哈希在变，就是时间戳之类在作怪 */
+function hashNoDigit(s: string): string {
+  return hash(s.replace(/\d/g, "0"));
+}
+
+/** 找出和上一次的第一处差异，把前后文打出来 */
+function diff(prev: string, cur: string): string {
+  if (prev === "") return "first";
+  if (prev === cur) return "same";
+  let i = 0;
+  const min = Math.min(prev.length, cur.length);
+  while (i < min && prev[i] === cur[i]) i++;
+  const from = Math.max(0, i - 20);
+  const a = prev.slice(from, i + 30).replace(/\s+/g, " ");
+  const b = cur.slice(from, i + 30).replace(/\s+/g, " ");
+  return `@${i} OLD<${a}> NEW<${b}>`;
+}
+
+/** 扫出请求里已有的所有缓存断点及其位置和 TTL */
+function scanBreakpoints(body: Record<string, unknown>): string {
+  const found: string[] = [];
+  const ttlOf = (o: unknown): string | null => {
+    if (!o || typeof o !== "object") return null;
+    const cc = (o as Record<string, unknown>).cache_control;
+    if (!cc || typeof cc !== "object") return null;
+    return String((cc as Record<string, unknown>).ttl ?? "5m");
+  };
+
+  const sys = body.system;
+  if (Array.isArray(sys)) {
+    sys.forEach((b, i) => {
+      const t = ttlOf(b);
+      if (t) found.push(`sys${i}:${t}`);
+    });
+  }
+
+  const tools = body.tools;
+  if (Array.isArray(tools)) {
+    tools.forEach((x, i) => {
+      const t = ttlOf(x);
+      if (t) found.push(`tool${i}:${t}`);
+    });
+  }
+
+  const msgs = body.messages;
+  if (Array.isArray(msgs)) {
+    msgs.forEach((m, i) => {
+      const c = m && typeof m === "object"
+        ? (m as Record<string, unknown>).content
+        : null;
+      if (!Array.isArray(c)) return;
+      c.forEach((b, j) => {
+        const t = ttlOf(b);
+        if (t) found.push(`msg${i}.${j}:${t}`);
+      });
+    });
+  }
+
+  return found.length === 0 ? "none" : `${found.length}[${found.join(",")}]`;
 }
 
 function clock(): string {
   return new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(11, 19);
 }
 
-Deno.serve(async (req: Request) => {
+function textResponse(body: string): Response {
+  return new Response(body, {
+    headers: { "content-type": "text/plain; charset=utf-8" },
+  });
+}
+
+Deno.serve({ port: PORT }, async (req: Request) => {
   const url = new URL(req.url);
   const path = url.pathname;
 
-  // 浏览器打开这个地址看日志
   if (path === "/logs") {
-    const text = LINES.length === 0
-      ? "暂无记录，先去 LobeHub 聊几轮再刷新。"
-      : LINES.join("\n");
-    return new Response(text, {
-      headers: { "content-type": "text/plain; charset=utf-8" },
-    });
+    return textResponse(
+      LINES.length === 0
+        ? "暂无记录。若已聊过天，说明请求没到这个代理，检查 LobeHub 的 Base URL。"
+        : LINES.join("\n\n"),
+    );
   }
 
   if (path === "/logs/clear") {
     LINES.length = 0;
-    return new Response("已清空", {
-      headers: { "content-type": "text/plain; charset=utf-8" },
-    });
+    prevSys = "";
+    prevTools = "";
+    return textResponse("已清空");
   }
 
   if (path === "/health") {
-    const info = { ok: true, ttl: TTL, lines: LINES.length, upstream: UPSTREAM };
-    return new Response(JSON.stringify(info), {
-      headers: { "content-type": "application/json" },
-    });
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        ttl: TTL,
+        lines: LINES.length,
+        upstream: UPSTREAM,
+      }),
+      { headers: { "content-type": "application/json" } },
+    );
   }
 
   const headers = new Headers(req.headers);
@@ -69,7 +148,9 @@ Deno.serve(async (req: Request) => {
   const isMessages = req.method === "POST" &&
     (path === "/v1/messages" || path === "/messages");
 
+  // 非 messages 的请求也记一笔，用来确认请求到底有没有到这里
   if (!isMessages) {
+    record(`~ ${clock()} PASSTHRU ${req.method} ${path}`);
     const res = await fetch(UPSTREAM + path + url.search, {
       method: req.method,
       headers,
@@ -89,8 +170,18 @@ Deno.serve(async (req: Request) => {
     return new Response('{"error":"bad json"}', { status: 400 });
   }
 
+  // ===== 注入前先把原始状态全部记下来 =====
   const clientBeta = headers.get("anthropic-beta") ?? "-";
   const rawType = typeof body.system;
+  const bpIn = scanBreakpoints(body);
+
+  const sysStr = str(body.system);
+  const toolsStr = str(body.tools);
+  const sysDiff = diff(prevSys, sysStr);
+  const toolsDiff = diff(prevTools, toolsStr);
+  prevSys = sysStr;
+  prevTools = toolsStr;
+
   const msgs = Array.isArray(body.messages) ? body.messages : [];
   const roles = msgs
     .map((m) =>
@@ -100,6 +191,7 @@ Deno.serve(async (req: Request) => {
     )
     .join("");
 
+  // ===== 注入 1h 断点 =====
   let apply = "none";
   if (typeof body.system === "string" && body.system.trim() !== "") {
     body.system = [{ type: "text", text: body.system }];
@@ -116,6 +208,7 @@ Deno.serve(async (req: Request) => {
     }
   }
 
+  // 1h 必须带 beta，否则被当成默认 5m
   if (apply !== "none") {
     const parts = (headers.get("anthropic-beta") ?? "")
       .split(",")
@@ -125,24 +218,30 @@ Deno.serve(async (req: Request) => {
     headers.set("anthropic-beta", parts.join(","));
   }
   const sentBeta = headers.get("anthropic-beta") ?? "-";
+  const bpOut = scanBreakpoints(body);
 
   headers.set("content-type", "application/json");
 
   const head = [
-    `#${id}`,
-    clock(),
+    `#${id} ${clock()}`,
     `model=${body.model ?? "?"}`,
+    `stream=${body.stream === true}`,
     `sysType=${rawType}`,
     `sys=${hash(body.system)}`,
+    `sysND=${hashNoDigit(sysStr)}`,
     `tools=${hash(body.tools)}`,
+    `toolsND=${hashNoDigit(toolsStr)}`,
     `msgs=${msgs.length}:${roles}`,
     `head2=${hash(msgs.slice(0, 2))}`,
     `tail1=${hash(msgs.slice(-1))}`,
-    `stream=${body.stream === true}`,
+    `bpIn=${bpIn}`,
+    `bpOut=${bpOut}`,
     `apply=${apply}`,
     `betaIn=${clientBeta}`,
     `betaOut=${sentBeta}`,
   ].join(" ");
+
+  const diffs = `  SYSDIFF ${sysDiff}\n  TOOLSDIFF ${toolsDiff}`;
 
   let res: Response;
   try {
@@ -152,7 +251,7 @@ Deno.serve(async (req: Request) => {
       body: JSON.stringify(body),
     });
   } catch (e) {
-    record(`${head} | FETCH-ERR ${e instanceof Error ? e.message : e}`);
+    record(`${head}\n${diffs}\n  FETCH-ERR ${e instanceof Error ? e.message : e}`);
     return new Response('{"error":"upstream unreachable"}', { status: 502 });
   }
 
@@ -161,10 +260,11 @@ Deno.serve(async (req: Request) => {
   out.delete("content-length");
 
   if (!res.ok || !res.body) {
-    record(`${head} | status=${res.status} usage=unread`);
+    record(`${head}\n${diffs}\n  status=${res.status} usage=unread`);
     return new Response(res.body, { status: res.status, headers: out });
   }
 
+  // tee：一路原样给客户端（流式不受影响），一路只读 usage
   const [toClient, toLog] = res.body.tee();
   (async () => {
     try {
@@ -181,9 +281,9 @@ Deno.serve(async (req: Request) => {
         `in=${pick("input_tokens")}`,
         `out=${pick("output_tokens")}`,
       ].join(" ");
-      record(`${head} | ${tail}`);
+      record(`${head}\n${diffs}\n  ${tail}`);
     } catch (e) {
-      record(`${head} | usage-err ${e instanceof Error ? e.message : e}`);
+      record(`${head}\n${diffs}\n  usage-err ${e instanceof Error ? e.message : e}`);
     }
   })();
 
