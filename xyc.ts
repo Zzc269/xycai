@@ -1,11 +1,11 @@
-// xyc 1h 缓存注入代理 · 最终版
-// Deno Deploy / Zeabur 通用，不需要设置任何环境变量
-// 查看日志：https://你的域名/logs
+// xyc 缓存注入代理 · 可切档 + 原始响应诊断
+// 环境变量 MODE：off（默认，不注入）| sys（只升 system）| all（全升 1h）
 
 const UPSTREAM = "https://apicdn.xycai.us";
 const TTL = "1h";
 const BETA = "extended-cache-ttl-2025-04-11";
 const PORT = Number(Deno.env.get("PORT") ?? "8000");
+const MODE = Deno.env.get("MODE") ?? "off";
 
 const STRIP = [
   "host",
@@ -36,7 +36,6 @@ function clock(): string {
   return new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(11, 19);
 }
 
-/** 扫出请求里所有缓存断点的位置和 TTL */
 function scanBreakpoints(body: Record<string, unknown>): string {
   const found: string[] = [];
   const ttlOf = (o: unknown): string | null => {
@@ -84,12 +83,10 @@ Deno.serve({ port: PORT }, async (req: Request) => {
   const path = url.pathname;
 
   if (path === "/logs") {
-    const text = LINES.length === 0
-      ? "暂无记录，先去 LobeHub 聊几轮再刷新。"
-      : LINES.join("\n");
-    return new Response(text, {
-      headers: { "content-type": "text/plain; charset=utf-8" },
-    });
+    return new Response(
+      LINES.length === 0 ? "暂无记录。" : LINES.join("\n\n"),
+      { headers: { "content-type": "text/plain; charset=utf-8" } },
+    );
   }
 
   if (path === "/logs/clear") {
@@ -100,10 +97,10 @@ Deno.serve({ port: PORT }, async (req: Request) => {
   }
 
   if (path === "/health") {
-    const info = { ok: true, ttl: TTL, lines: LINES.length, upstream: UPSTREAM };
-    return new Response(JSON.stringify(info), {
-      headers: { "content-type": "application/json" },
-    });
+    return new Response(
+      JSON.stringify({ ok: true, mode: MODE, ttl: TTL, lines: LINES.length }),
+      { headers: { "content-type": "application/json" } },
+    );
   }
 
   const headers = new Headers(req.headers);
@@ -133,7 +130,6 @@ Deno.serve({ port: PORT }, async (req: Request) => {
   }
 
   const clientBeta = headers.get("anthropic-beta") ?? "-";
-  const rawType = typeof body.system;
   const bpIn = scanBreakpoints(body);
   const msgs = Array.isArray(body.messages) ? body.messages : [];
   const roles = msgs
@@ -144,50 +140,42 @@ Deno.serve({ port: PORT }, async (req: Request) => {
     )
     .join("");
 
-  // ===== 第一步：把客户端已有的断点全部升成 1h =====
-  // 必须全部升，不能只升一个。Anthropic 要求长 TTL 排在短 TTL 之前，
-  // 混档（部分 1h 部分 5m）会导致整个请求按 5m 处理。
-  let upgraded = 0;
-  const upgrade = (o: unknown) => {
-    if (!o || typeof o !== "object") return;
+  let apply = "off";
+  const toOneHour = (o: unknown) => {
+    if (!o || typeof o !== "object") return false;
     const obj = o as Record<string, unknown>;
     const cc = obj.cache_control;
-    if (!cc || typeof cc !== "object") return;
+    if (!cc || typeof cc !== "object") return false;
     obj.cache_control = { type: "ephemeral", ttl: TTL };
-    upgraded++;
+    return true;
   };
 
-  if (Array.isArray(body.system)) body.system.forEach(upgrade);
-  if (Array.isArray(body.tools)) body.tools.forEach(upgrade);
-  for (const m of msgs) {
-    const c = m && typeof m === "object"
-      ? (m as Record<string, unknown>).content
-      : null;
-    if (Array.isArray(c)) c.forEach(upgrade);
+  if (MODE === "sys") {
+    // 只升 system 里的断点，tools 和 messages 保持原样
+    let n = 0;
+    if (Array.isArray(body.system)) {
+      for (const b of body.system) if (toOneHour(b)) n++;
+    }
+    apply = `sys:${n}`;
+  } else if (MODE === "all") {
+    // 全部升成 1h
+    let n = 0;
+    if (Array.isArray(body.system)) {
+      for (const b of body.system) if (toOneHour(b)) n++;
+    }
+    if (Array.isArray(body.tools)) {
+      for (const x of body.tools) if (toOneHour(x)) n++;
+    }
+    for (const m of msgs) {
+      const c = m && typeof m === "object"
+        ? (m as Record<string, unknown>).content
+        : null;
+      if (Array.isArray(c)) for (const b of c) if (toOneHour(b)) n++;
+    }
+    apply = `all:${n}`;
   }
 
-  // ===== 第二步：客户端一个断点都没发时，代理自己补一个 =====
-  // 客户端已经发了就别再插，避免超过 4 个上限。
-  let apply = upgraded > 0 ? `upgrade:${upgraded}` : "none";
-  if (upgraded === 0) {
-    if (typeof body.system === "string" && body.system.trim() !== "") {
-      body.system = [{ type: "text", text: body.system }];
-    }
-    const sys = body.system;
-    if (Array.isArray(sys) && sys.length > 0) {
-      const last = sys[sys.length - 1];
-      if (last && typeof last === "object") {
-        (last as Record<string, unknown>).cache_control = {
-          type: "ephemeral",
-          ttl: TTL,
-        };
-        apply = `new:sys${sys.length - 1}`;
-      }
-    }
-  }
-
-  // 1h TTL 必须声明 beta，否则被当成默认 5m
-  if (apply !== "none") {
+  if (MODE !== "off") {
     const parts = (headers.get("anthropic-beta") ?? "")
       .split(",")
       .map((s) => s.trim())
@@ -202,13 +190,11 @@ Deno.serve({ port: PORT }, async (req: Request) => {
   const head = [
     `#${id}`,
     clock(),
+    `MODE=${MODE}`,
     `model=${body.model ?? "?"}`,
-    `sysType=${rawType}`,
     `sys=${hash(body.system)}`,
     `tools=${hash(body.tools)}`,
     `msgs=${msgs.length}:${roles}`,
-    `head2=${hash(msgs.slice(0, 2))}`,
-    `tail1=${hash(msgs.slice(-1))}`,
     `stream=${body.stream === true}`,
     `bpIn=${bpIn}`,
     `bpOut=${scanBreakpoints(body)}`,
@@ -225,7 +211,7 @@ Deno.serve({ port: PORT }, async (req: Request) => {
       body: JSON.stringify(body),
     });
   } catch (e) {
-    record(`${head} | FETCH-ERR ${e instanceof Error ? e.message : e}`);
+    record(`${head}\n  FETCH-ERR ${e instanceof Error ? e.message : e}`);
     return new Response('{"error":"upstream unreachable"}', { status: 502 });
   }
 
@@ -233,9 +219,9 @@ Deno.serve({ port: PORT }, async (req: Request) => {
   out.delete("content-encoding");
   out.delete("content-length");
 
-  if (!res.ok || !res.body) {
-    record(`${head} | status=${res.status} usage=unread`);
-    return new Response(res.body, { status: res.status, headers: out });
+  if (!res.body) {
+    record(`${head}\n  status=${res.status} NO-BODY ct=${res.headers.get("content-type")}`);
+    return new Response(null, { status: res.status, headers: out });
   }
 
   const [toClient, toLog] = res.body.tee();
@@ -246,17 +232,22 @@ Deno.serve({ port: PORT }, async (req: Request) => {
         const m = new RegExp('"' + k + '"\\s*:\\s*(\\d+)').exec(text);
         return m ? m[1] : "-";
       };
-      const tail = [
+      const usage = [
         `status=${res.status}`,
+        `len=${text.length}`,
         `read=${pick("cache_read_input_tokens")}`,
         `w1h=${pick("ephemeral_1h_input_tokens")}`,
         `w5m=${pick("ephemeral_5m_input_tokens")}`,
         `in=${pick("input_tokens")}`,
         `out=${pick("output_tokens")}`,
       ].join(" ");
-      record(`${head} | ${tail}`);
+      // 没解析到 usage 时，把上游原样返回的前 400 字打出来
+      const raw = pick("input_tokens") === "-"
+        ? `\n  RAW ct=${res.headers.get("content-type")} <${text.slice(0, 400).replace(/\s+/g, " ")}>`
+        : "";
+      record(`${head}\n  ${usage}${raw}`);
     } catch (e) {
-      record(`${head} | usage-err ${e instanceof Error ? e.message : e}`);
+      record(`${head}\n  usage-err ${e instanceof Error ? e.message : e}`);
     }
   })();
 
