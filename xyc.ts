@@ -5,7 +5,7 @@ const UPSTREAM = "https://apicdn.xycai.us";
 const TTL = "1h";
 const BETA = "extended-cache-ttl-2025-04-11";
 const PORT = Number(Deno.env.get("PORT") ?? "8000");
-const MODE = Deno.env.get("MODE") ?? "off";
+const MODE = Deno.env.get("MODE") ?? "all";
 
 const STRIP = [
   "host",
