@@ -164,6 +164,43 @@ function shortHash(v: unknown): string {
   return `${(h >>> 0).toString(16).padStart(8, "0")}/${s.length}`;
 }
 
+/**
+ * 诊断哈希忽略 cache_control 和代理时间块。
+ * 因此两次日志的哈希不同时，代表真实提示内容发生了变化。
+ */
+function diagnosticValue(v: unknown): unknown {
+  if (Array.isArray(v)) {
+    return v
+      .filter((item) => !(
+        isObj(item) &&
+        item.type === "text" &&
+        typeof item.text === "string" &&
+        item.text.includes(RUNTIME_MARKER)
+      ))
+      .map(diagnosticValue);
+  }
+  if (!isObj(v)) return v;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(v)) {
+    if (key === "cache_control") continue;
+    out[key] = diagnosticValue(value);
+  }
+  return out;
+}
+
+function diagnosticHash(v: unknown): string {
+  return shortHash(diagnosticValue(v));
+}
+
+function messageHashes(body: Any): string {
+  if (!Array.isArray(body?.messages)) return "-";
+  return body.messages.map((msg: unknown, index: number) => {
+    if (!isObj(msg)) return `${index}?:invalid`;
+    const role = String(msg.role ?? "?").slice(0, 1);
+    return `${index}${role}:${diagnosticHash(msg.content)}`;
+  }).join(",");
+}
+
 function cc() {
   return { type: "ephemeral", ttl: TTL };
 }
@@ -687,6 +724,9 @@ async function handler(req: Request): Promise<Response> {
     `path=${path}`,
     `model=${body?.model ?? "?"}`,
     `prompt=${inputHash}`,
+    `sys=${diagnosticHash(body?.system)}`,
+    `tools=${diagnosticHash(body?.tools)}`,
+    `mh=${messageHashes(body)}`,
     `msgs=${messageCount}:${rolesOf(body)}`,
     `stream=${body?.stream === true}`,
     `bpIn=${bpIn}`,
