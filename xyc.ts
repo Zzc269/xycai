@@ -38,7 +38,7 @@ const MODE_VALUES = new Set<BreakpointMode>([
   "off",
 ]);
 
-const rawMode = (Deno.env.get("BREAKPOINT_MODE") ?? "system").toLowerCase();
+const rawMode = "message";
 const MODE: BreakpointMode = MODE_VALUES.has(rawMode as BreakpointMode)
   ? rawMode as BreakpointMode
   : "system";
