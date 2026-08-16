@@ -3,24 +3,24 @@
  * Deno Deploy Playground 单文件版
  *
  * LobeHub Anthropic Base URL：
- *   https://你的项目名.deno.dev
+ * https://你的项目名.deno.dev
  *
  * 默认行为：
- *   1. 默认删除 LobeHub 自带的 5m 断点，只在最新消息放 1 个 1h 断点
- *      （该断点会缓存它之前的 tools、system 和全部消息）
- *   2. 在最后一条 user 消息的缓存断点之后追加当前时间（时间块本身不缓存）
- *   3. 每个入站请求只向 xyc 发起 1 次请求，绝不自动重试
- *   4. /logs 显示断点、缓存 usage、失败原文和请求编号
+ * 1. 默认删除 LobeHub 自带的 5m 断点，只在最新消息放 1 个 1h 断点
+ *    （该断点会缓存它之前的 tools、system 和全部消息）
+ * 2. 在最后一条 user 消息的缓存断点之后追加当前时间（时间块本身不缓存）
+ * 3. 每个入站请求只向 xyc 发起 1 次请求，绝不自动重试
+ * 4. /logs 显示断点、缓存 usage、失败原文和请求编号
  *
  * 可选环境变量：
- *   UPSTREAM_URL        默认 https://apicdn.xycai.us
- *   PROXY_TOKEN         可选访问令牌；设置后请求需带 x-proxy-token
- *   CACHE_TTL_ON        "0" = 不改缓存；默认开启
- *   BREAKPOINT_MODE     "message"（默认，单 message 断点）| "all"（最多 4 断点）
- *   TAIL_BREAKPOINTS    最近消息断点数；默认 2，建议 1~2
- *   INJECT_CURRENT_TIME "0" = 不注入当前时间；默认开启
- *   TIME_ZONE           默认 Asia/Shanghai
- *   DEBUG               "1" = 成功请求也实时打印详细日志
+ * UPSTREAM_URL        默认 https://apicdn.xycai.us
+ * PROXY_TOKEN         可选访问令牌；设置后请求需带 x-proxy-token
+ * CACHE_TTL_ON        "0" = 不改缓存；默认开启
+ * BREAKPOINT_MODE     "message"（默认，单 message 断点）| "all"（最多 4 断点）
+ * TAIL_BREAKPOINTS    最近消息断点数；默认 2，建议 1~2
+ * INJECT_CURRENT_TIME "0" = 不注入当前时间；默认开启
+ * TIME_ZONE           默认 Asia/Shanghai
+ * DEBUG               "1" = 成功请求也实时打印详细日志
  */
 
 const PROVIDER = "xyc";
@@ -545,13 +545,19 @@ interface ForwardMeta {
 
 /**
  * 注意：这里只有一次 fetch，没有循环、退避或自动重试。
+ *
+ * 方案 A：不再接收 / 传递 AbortSignal（去掉了 req.signal）。
+ * 原因：Deno.serve 默认 legacy 行为下，request.signal 会在响应成功
+ * 完整送达后触发 abort，可能掐断 tee 出来的后台日志读取流
+ * （表现为 usage 日志缺失或 usage-log-error），长 SSE 流也有竞态。
+ * 去掉 signal 后该弃用警告消失，且代理始终让上游请求跑完。
+ * 代价：客户端中途断开时，上游不会跟着中止（会流完整个响应）。
  */
 async function forwardOnce(
   method: string,
   target: string,
   headers: Headers,
   body: BodyInit | null,
-  signal: AbortSignal,
   meta: ForwardMeta,
 ): Promise<Response> {
   let upstream: Response;
@@ -561,7 +567,6 @@ async function forwardOnce(
       method,
       headers,
       body,
-      signal,
       ...(body !== null && typeof body === "object" ? { duplex: "half" } : {}),
     } as RequestInit);
   } catch (error) {
@@ -666,7 +671,7 @@ async function handler(req: Request): Promise<Response> {
   const rewriteable = req.method === "POST" && (isMessagesPath(path) || isChatPath(path));
   if (!rewriteable) {
     const head = `#${id} ${clock()} path=${path} passthrough`;
-    return await forwardOnce(req.method, target, headers, req.body, req.signal, {
+    return await forwardOnce(req.method, target, headers, req.body, {
       id,
       head,
       path,
@@ -743,7 +748,6 @@ async function handler(req: Request): Promise<Response> {
     target,
     headers,
     JSON.stringify(body),
-    req.signal,
     { id, head, path },
   );
 }
