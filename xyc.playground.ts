@@ -24,7 +24,7 @@
  */
 
 const PROVIDER = "xyc";
-const DEFAULT_UPSTREAM = "https://apicdn.xycai.us";
+const DEFAULT_UPSTREAM = "https://cn.chatapi.app";
 const TTL = "1h";
 const BETA_FLAG = "extended-cache-ttl-2025-04-11";
 const MAX_BREAKPOINTS = 4;
