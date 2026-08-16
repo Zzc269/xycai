@@ -1,3 +1,36 @@
+/**
+ * xyc relay - Claude 1h full-prefix cache + current-time injection + response diagnostics
+ * Single-file version for Deno Deploy Playground (v2: force non-stream + SSE conversion)
+ *
+ * LobeHub Anthropic Base URL:
+ * https://YOUR_PROJECT.deno.dev
+ *
+ * v2 changes (fix: cn.chatapi.app streaming path rejects message-level ttl:"1h"):
+ * - FORCE_NON_STREAM=1 (default on): rewrites incoming stream=true requests to
+ *   stream=false before forwarding upstream (non-stream + 1h cache works, proven),
+ *   then converts the full JSON response back into an SSE event stream so LobeHub
+ *   renders normally. Set FORCE_NON_STREAM=0 to restore passthrough streaming.
+ *
+ * Default behavior:
+ * 1. Removes LobeHub's built-in 5m breakpoints, places a single 1h breakpoint on
+ *    the last message (it caches all preceding tools/system/messages).
+ * 2. Appends current time after the cache breakpoint of the last user message
+ *    (the time block itself is never cached).
+ * 3. Each incoming request triggers exactly 1 upstream request, no auto retry.
+ * 4. /logs shows breakpoints, cache usage, raw failures and request ids.
+ *
+ * Optional env vars:
+ * UPSTREAM_URL        default https://cn.chatapi.app
+ * PROXY_TOKEN         optional access token; requests must carry x-proxy-token
+ * CACHE_TTL_ON        "0" = do not touch cache; default on
+ * BREAKPOINT_MODE     "message" (default, single message breakpoint) | "all" (max 4)
+ * TAIL_BREAKPOINTS    number of tail message breakpoints; default 2, suggest 1~2
+ * INJECT_CURRENT_TIME "0" = do not inject current time; default on
+ * TIME_ZONE           default Asia/Shanghai
+ * DEBUG               "1" = print detailed logs for successful requests too
+ * FORCE_NON_STREAM    "0" = passthrough streaming (may hit upstream 502); default force non-stream + SSE
+ */
+
 const PROVIDER = "xyc";
 const DEFAULT_UPSTREAM = "https://cn.chatapi.app";
 const TTL = "1h";
@@ -141,8 +174,8 @@ function shortHash(v: unknown): string {
 }
 
 /**
- * 璇婃柇鍝堝笇蹇界暐 cache_control 鍜屼唬鐞嗘椂闂村潡銆�
- * 鍥犳涓ゆ鏃ュ織鐨勫搱甯屼笉鍚屾椂锛屼唬琛ㄧ湡瀹炴彁绀哄唴瀹瑰彂鐢熶簡鍙樺寲銆�
+ * Diagnostic hash ignores cache_control and the proxy time block,
+ * so different hashes between two logs mean the real prompt changed.
  */
 function diagnosticValue(v: unknown): unknown {
   if (Array.isArray(v)) {
@@ -235,8 +268,8 @@ function lastCacheable(blocks: Record<string, Any>[]): Record<string, Any> | nul
 }
 
 /**
- * 濡傛灉涓婁竴娆′唬鐞嗘椂闂村潡琚煇涓鎴风鎰忓淇濆瓨杩涗簡鍘嗗彶锛岃鍏堢Щ闄ゃ€�
- * 姝ｅ父 LobeHub 涓嶄細淇濆瓨浠ｇ悊鏀瑰啓鍚庣殑璇锋眰锛屾澶勫彧鏄槻寰℃€у鐞嗐€�
+ * Remove a previously injected runtime time block if some client saved it into
+ * history. Normal LobeHub does not save rewritten requests; this is defensive.
  */
 function removeOldRuntimeBlocks(body: Any): number {
   if (!Array.isArray(body?.messages)) return 0;
@@ -264,9 +297,10 @@ interface InjectResult {
 }
 
 /**
- * 鍗� message 鏂偣妯″紡銆�
- * 鍏堢Щ闄� LobeHub 鑷甫鐨� 5m 鏂偣锛岄伩鍏嶆棫 5m 鐖剁紦瀛樺拰鏂� 1h 澧為噺娣风敤锛�
- * 鍐嶆妸鍞竴鐨� 1h 鏂偣鏀惧埌鏈€鏂版秷鎭殑鏈€鍚庝竴涓彲缂撳瓨鍧椼€�
+ * Single message breakpoint mode.
+ * Removes LobeHub's 5m breakpoints (avoid mixing old 5m parent cache with the
+ * new 1h delta), then places the single 1h breakpoint on the last cacheable
+ * block of the newest message.
  */
 function injectAnthropicMessage(body: Any): InjectResult {
   const holders = existingHolders(body);
@@ -301,8 +335,9 @@ function injectAnthropicMessage(body: Any): InjectResult {
 }
 
 /**
- * 澶氭柇鐐瑰吋瀹规ā寮忥細淇濈暀 LobeHub 鐨勫凡鏈夋柇鐐瑰苟鍏ㄩ儴鍗囩骇鎴� 1h锛�
- * 鍐嶆寜 tools -> system -> 鏈€杩戞秷鎭ˉ瓒筹紝鏈€澶� 4 涓€�
+ * Multi breakpoint compatibility mode: keep LobeHub's existing breakpoints and
+ * upgrade all of them to 1h, then top up tools -> system -> tail messages,
+ * up to 4 breakpoints.
  */
 function injectAnthropicAll(body: Any, tailBreakpoints: number): InjectResult {
   const applied: string[] = [];
@@ -411,8 +446,8 @@ function injectOpenAI(body: Any): InjectResult {
 }
 
 /**
- * 蹇呴』鍦� injectAnthropic() 涔嬪悗璋冪敤銆�
- * 鏂版椂闂村潡浣嶄簬鏈€鏂扮紦瀛樻柇鐐逛箣鍚庯紝涓斿畠鑷繁缁濅笉甯� cache_control銆�
+ * Must be called after injectAnthropic(). The new time block sits after the
+ * newest cache breakpoint and never carries cache_control itself.
  */
 function appendCurrentTime(body: Any): { added: boolean; reason?: string } {
   if (!Array.isArray(body?.messages) || body.messages.length === 0) {
@@ -437,10 +472,10 @@ function appendCurrentTime(body: Any): { added: boolean; reason?: string } {
     text:
       `<!-- ${RUNTIME_MARKER} -->\n` +
       `<runtime_context source="request_proxy">\n` +
-      `褰撳墠鏃堕棿锛�${formatTime(now)}\n` +
-      `鏃跺尯锛�${TIME_ZONE}\n` +
-      `杩欐槸浠ｇ悊鑷姩鍔犲叆鐨勮繍琛屾椂淇℃伅锛屼笉鏄敤鎴峰師鏂囥€俙 +
-      `浠呭湪闂娑夊強鐜板湪銆佷粖澶┿€佹棩鏈熴€佹椂闄愭垨鐩稿鏃堕棿鏃朵娇鐢ㄣ€俓n` +
+      `Current time: ${formatTime(now)}\n` +
+      `Time zone: ${TIME_ZONE}\n` +
+      `This is runtime info added by the proxy, not the user's original text. ` +
+      `Only use it when the question involves now, today, dates, deadlines or relative time.\n` +
       `</runtime_context>`,
   });
   return { added: true };
@@ -525,8 +560,9 @@ function sseFrame(event: string, data: unknown): string {
 }
 
 /**
- * 鎶婁笂娓歌繑鍥炵殑瀹屾暣 JSON锛堥潪娴佸紡 message 鍝嶅簲锛夎浆鎴� Anthropic SSE 浜嬩欢娴併€�
- * 鏀寔 text / thinking / tool_use 鍐呭鍧楋紝浠ュ強閿欒瀵硅薄銆�
+ * Convert the upstream's full JSON (non-stream message response) into an
+ * Anthropic SSE event stream. Supports text / thinking / tool_use blocks and
+ * error objects.
  */
 function toSse(text: string): string {
   let parsed: Any;
@@ -589,10 +625,10 @@ function toSse(text: string): string {
 }
 
 /**
- * 娉ㄦ剰锛氳繖閲屽彧鏈変竴娆� fetch锛屾病鏈夊惊鐜€侀€€閬挎垨鑷姩閲嶈瘯銆�
- * 鏂规 A锛氫笉鍐嶆帴鏀� / 浼犻€� AbortSignal锛堝幓鎺変簡 req.signal锛夛紝閬垮厤
- * Deno.serve legacy 琛屼负涓� request.signal 鍦ㄥ搷搴旈€佽揪鍚庤Е鍙� abort銆�
- * convertSse 妯″紡涓嬶細璇诲畬鏁� JSON -> 杞� SSE -> 鍥炵粰瀹㈡埛绔€�
+ * Exactly one fetch here: no loops, no backoff, no auto retry.
+ * Option A: no AbortSignal is passed (dropped req.signal) to avoid Deno.serve
+ * legacy behavior aborting the request signal after a successful response.
+ * In convertSse mode: read full JSON -> convert to SSE -> respond to client.
  */
 async function forwardOnce(
   method: string,
@@ -620,7 +656,7 @@ async function forwardOnce(
   const elapsed = Math.round(performance.now() - started);
 
   if (meta.convertSse) {
-    // 涓婃父鎸� stream=false 杩斿洖瀹屾暣 JSON锛岃繖閲岃鍙栧悗杞垚 SSE 浜嬩欢娴�
+    // Upstream was called with stream=false and returns full JSON; convert to SSE.
     let text = "";
     try {
       text = await new Response(upstream.body).text();
@@ -705,7 +741,7 @@ async function handler(req: Request): Promise<Response> {
     const supplied = req.headers.get("x-proxy-token") || url.searchParams.get("proxy_token") || "";
     if (!safeEqual(supplied, PROXY_TOKEN)) return json({ error: "unauthorized" }, 401);
   }
-  // 鍏佽娴忚鍣ㄧ敤 ?proxy_token=... 鏌ョ湅璇婃柇椤碉紝浣嗙粷涓嶆妸浠ょ墝杞彂缁欎笂娓搞€�
+  // Allow viewing diagnostics via ?proxy_token=... in browser, never forward it upstream.
   url.searchParams.delete("proxy_token");
 
   if (req.method === "GET" && (path === "/" || path === "/health")) {
@@ -726,14 +762,14 @@ async function handler(req: Request): Promise<Response> {
 
   if (req.method === "GET" && path === "/logs") {
     return new Response(
-      LOG_LINES.length === 0 ? "鏆傛棤璁板綍銆�" : LOG_LINES.join("\n\n"),
+      LOG_LINES.length === 0 ? "No logs yet." : LOG_LINES.join("\n\n"),
       { headers: { ...CORS_HEADERS, "content-type": "text/plain; charset=utf-8" } },
     );
   }
 
   if ((req.method === "GET" || req.method === "POST") && path === "/logs/clear") {
     LOG_LINES.length = 0;
-    return new Response("宸叉竻绌�", {
+    return new Response("Logs cleared.", {
       headers: { ...CORS_HEADERS, "content-type": "text/plain; charset=utf-8" },
     });
   }
@@ -783,8 +819,8 @@ async function handler(req: Request): Promise<Response> {
       ? `skipped(${result.skipped}) applied[${result.applied.join(" ")}]`
       : `applied[${result.applied.join(" ")}]`;
 
-    // 鍙缂撳瓨鍔熻兘寮€鍚紝Anthropic 鍘熺敓璺緞灏卞缁堣ˉ beta銆�
-    // 涓嶈兘鍙湪 body 鍙戠敓鍙樺寲鏃惰ˉ锛屽惁鍒�"璇锋眰鍘熸湰宸茬粡鏄� 1h"鏃朵細婕忓ご銆�
+    // As long as caching is enabled, always add beta on the Anthropic native path.
+    // Do not add it only when the body changed, or requests already at 1h would miss it.
     if (isMessagesPath(path)) {
       headers.set("anthropic-beta", mergeBetaHeader(headers.get("anthropic-beta")));
     }
@@ -796,7 +832,7 @@ async function handler(req: Request): Promise<Response> {
     timeNote = result.added ? "added-after-cache" : `skipped(${result.reason})`;
   }
 
-  // v2锛氬己鍒堕潪娴佸紡锛堜粎 Anthropic messages 璺緞 + 鍏ョ珯涓烘祦寮忔椂锛�
+  // v2: force non-stream (Anthropic messages path + incoming stream only)
   let streamNote = "passthrough";
   let convertSse = false;
   if (FORCE_NON_STREAM && isMessagesPath(path) && body?.stream === true) {
