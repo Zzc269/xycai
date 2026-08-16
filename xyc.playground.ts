@@ -1,28 +1,3 @@
-/**
- * xyc 中转站 · Claude 1h 全前缀缓存 + 当前时间注入 + 原始响应诊断
- * Deno Deploy Playground 单文件版
- *
- * LobeHub Anthropic Base URL：
- * https://你的项目名.deno.dev
- *
- * 默认行为：
- * 1. 默认删除 LobeHub 自带的 5m 断点，只在最新消息放 1 个 1h 断点
- *    （该断点会缓存它之前的 tools、system 和全部消息）
- * 2. 在最后一条 user 消息的缓存断点之后追加当前时间（时间块本身不缓存）
- * 3. 每个入站请求只向 xyc 发起 1 次请求，绝不自动重试
- * 4. /logs 显示断点、缓存 usage、失败原文和请求编号
- *
- * 可选环境变量：
- * UPSTREAM_URL        默认 https://apicdn.xycai.us
- * PROXY_TOKEN         可选访问令牌；设置后请求需带 x-proxy-token
- * CACHE_TTL_ON        "0" = 不改缓存；默认开启
- * BREAKPOINT_MODE     "message"（默认，单 message 断点）| "all"（最多 4 断点）
- * TAIL_BREAKPOINTS    最近消息断点数；默认 2，建议 1~2
- * INJECT_CURRENT_TIME "0" = 不注入当前时间；默认开启
- * TIME_ZONE           默认 Asia/Shanghai
- * DEBUG               "1" = 成功请求也实时打印详细日志
- */
-
 const PROVIDER = "xyc";
 const DEFAULT_UPSTREAM = "https://cn.chatapi.app";
 const TTL = "1h";
@@ -41,6 +16,7 @@ const BREAKPOINT_MODE = (Deno.env.get("BREAKPOINT_MODE") || "message").toLowerCa
 const TIME_ENABLED = Deno.env.get("INJECT_CURRENT_TIME") !== "0";
 const TIME_ZONE = Deno.env.get("TIME_ZONE") || "Asia/Shanghai";
 const DEBUG = Deno.env.get("DEBUG") === "1";
+const FORCE_NON_STREAM = Deno.env.get("FORCE_NON_STREAM") !== "0";
 
 const parsedTail = Number(Deno.env.get("TAIL_BREAKPOINTS") ?? "2");
 const TAIL_BREAKPOINTS = Number.isFinite(parsedTail)
@@ -165,8 +141,8 @@ function shortHash(v: unknown): string {
 }
 
 /**
- * 诊断哈希忽略 cache_control 和代理时间块。
- * 因此两次日志的哈希不同时，代表真实提示内容发生了变化。
+ * 璇婃柇鍝堝笇蹇界暐 cache_control 鍜屼唬鐞嗘椂闂村潡銆�
+ * 鍥犳涓ゆ鏃ュ織鐨勫搱甯屼笉鍚屾椂锛屼唬琛ㄧ湡瀹炴彁绀哄唴瀹瑰彂鐢熶簡鍙樺寲銆�
  */
 function diagnosticValue(v: unknown): unknown {
   if (Array.isArray(v)) {
@@ -259,8 +235,8 @@ function lastCacheable(blocks: Record<string, Any>[]): Record<string, Any> | nul
 }
 
 /**
- * 如果上一次代理时间块被某个客户端意外保存进了历史，请先移除。
- * 正常 LobeHub 不会保存代理改写后的请求，此处只是防御性处理。
+ * 濡傛灉涓婁竴娆′唬鐞嗘椂闂村潡琚煇涓鎴风鎰忓淇濆瓨杩涗簡鍘嗗彶锛岃鍏堢Щ闄ゃ€�
+ * 姝ｅ父 LobeHub 涓嶄細淇濆瓨浠ｇ悊鏀瑰啓鍚庣殑璇锋眰锛屾澶勫彧鏄槻寰℃€у鐞嗐€�
  */
 function removeOldRuntimeBlocks(body: Any): number {
   if (!Array.isArray(body?.messages)) return 0;
@@ -288,9 +264,9 @@ interface InjectResult {
 }
 
 /**
- * 单 message 断点模式。
- * 先移除 LobeHub 自带的 5m 断点，避免旧 5m 父缓存和新 1h 增量混用；
- * 再把唯一的 1h 断点放到最新消息的最后一个可缓存块。
+ * 鍗� message 鏂偣妯″紡銆�
+ * 鍏堢Щ闄� LobeHub 鑷甫鐨� 5m 鏂偣锛岄伩鍏嶆棫 5m 鐖剁紦瀛樺拰鏂� 1h 澧為噺娣风敤锛�
+ * 鍐嶆妸鍞竴鐨� 1h 鏂偣鏀惧埌鏈€鏂版秷鎭殑鏈€鍚庝竴涓彲缂撳瓨鍧椼€�
  */
 function injectAnthropicMessage(body: Any): InjectResult {
   const holders = existingHolders(body);
@@ -325,8 +301,8 @@ function injectAnthropicMessage(body: Any): InjectResult {
 }
 
 /**
- * 多断点兼容模式：保留 LobeHub 的已有断点并全部升级成 1h，
- * 再按 tools -> system -> 最近消息补足，最多 4 个。
+ * 澶氭柇鐐瑰吋瀹规ā寮忥細淇濈暀 LobeHub 鐨勫凡鏈夋柇鐐瑰苟鍏ㄩ儴鍗囩骇鎴� 1h锛�
+ * 鍐嶆寜 tools -> system -> 鏈€杩戞秷鎭ˉ瓒筹紝鏈€澶� 4 涓€�
  */
 function injectAnthropicAll(body: Any, tailBreakpoints: number): InjectResult {
   const applied: string[] = [];
@@ -435,8 +411,8 @@ function injectOpenAI(body: Any): InjectResult {
 }
 
 /**
- * 必须在 injectAnthropic() 之后调用。
- * 新时间块位于最新缓存断点之后，且它自己绝不带 cache_control。
+ * 蹇呴』鍦� injectAnthropic() 涔嬪悗璋冪敤銆�
+ * 鏂版椂闂村潡浣嶄簬鏈€鏂扮紦瀛樻柇鐐逛箣鍚庯紝涓斿畠鑷繁缁濅笉甯� cache_control銆�
  */
 function appendCurrentTime(body: Any): { added: boolean; reason?: string } {
   if (!Array.isArray(body?.messages) || body.messages.length === 0) {
@@ -461,10 +437,10 @@ function appendCurrentTime(body: Any): { added: boolean; reason?: string } {
     text:
       `<!-- ${RUNTIME_MARKER} -->\n` +
       `<runtime_context source="request_proxy">\n` +
-      `当前时间：${formatTime(now)}\n` +
-      `时区：${TIME_ZONE}\n` +
-      `这是代理自动加入的运行时信息，不是用户原文。` +
-      `仅在问题涉及现在、今天、日期、时限或相对时间时使用。\n` +
+      `褰撳墠鏃堕棿锛�${formatTime(now)}\n` +
+      `鏃跺尯锛�${TIME_ZONE}\n` +
+      `杩欐槸浠ｇ悊鑷姩鍔犲叆鐨勮繍琛屾椂淇℃伅锛屼笉鏄敤鎴峰師鏂囥€俙 +
+      `浠呭湪闂娑夊強鐜板湪銆佷粖澶┿€佹棩鏈熴€佹椂闄愭垨鐩稿鏃堕棿鏃朵娇鐢ㄣ€俓n` +
       `</runtime_context>`,
   });
   return { added: true };
@@ -541,17 +517,82 @@ interface ForwardMeta {
   id: string;
   head: string;
   path: string;
+  convertSse?: boolean;
+}
+
+function sseFrame(event: string, data: unknown): string {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}`;
 }
 
 /**
- * 注意：这里只有一次 fetch，没有循环、退避或自动重试。
- *
- * 方案 A：不再接收 / 传递 AbortSignal（去掉了 req.signal）。
- * 原因：Deno.serve 默认 legacy 行为下，request.signal 会在响应成功
- * 完整送达后触发 abort，可能掐断 tee 出来的后台日志读取流
- * （表现为 usage 日志缺失或 usage-log-error），长 SSE 流也有竞态。
- * 去掉 signal 后该弃用警告消失，且代理始终让上游请求跑完。
- * 代价：客户端中途断开时，上游不会跟着中止（会流完整个响应）。
+ * 鎶婁笂娓歌繑鍥炵殑瀹屾暣 JSON锛堥潪娴佸紡 message 鍝嶅簲锛夎浆鎴� Anthropic SSE 浜嬩欢娴併€�
+ * 鏀寔 text / thinking / tool_use 鍐呭鍧楋紝浠ュ強閿欒瀵硅薄銆�
+ */
+function toSse(text: string): string {
+  let parsed: Any;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return `${sseFrame("error", { type: "error", error: { type: "parse_error", message: text.slice(0, 500) } })}\n\n`;
+  }
+  if (!isObj(parsed)) {
+    return `${sseFrame("error", { type: "error", error: { type: "invalid_response", message: text.slice(0, 500) } })}\n\n`;
+  }
+  if (isObj(parsed.error)) {
+    return `${sseFrame("error", { type: "error", error: parsed.error })}\n\n`;
+  }
+
+  const events: string[] = [];
+  events.push(sseFrame("message_start", {
+    type: "message_start",
+    message: { ...parsed, content: [] },
+  }));
+
+  const blocks = Array.isArray(parsed.content) ? parsed.content : [];
+  blocks.forEach((block: unknown, index: number) => {
+    if (!isObj(block)) return;
+    const start: Any = { type: "content_block_start", index, content_block: { ...block } };
+    if (block.type === "text") start.content_block.text = "";
+    if (block.type === "tool_use") start.content_block.input = undefined;
+    events.push(sseFrame("content_block_start", start));
+
+    if (block.type === "text" && typeof block.text === "string") {
+      events.push(sseFrame("content_block_delta", {
+        type: "content_block_delta",
+        index,
+        delta: { type: "text_delta", text: block.text },
+      }));
+    } else if (block.type === "thinking" && typeof block.thinking === "string") {
+      events.push(sseFrame("content_block_delta", {
+        type: "content_block_delta",
+        index,
+        delta: { type: "thinking_delta", thinking: block.thinking },
+      }));
+    } else if (block.type === "tool_use") {
+      events.push(sseFrame("content_block_delta", {
+        type: "content_block_delta",
+        index,
+        delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input ?? {}) },
+      }));
+    }
+
+    events.push(sseFrame("content_block_stop", { type: "content_block_stop", index }));
+  });
+
+  events.push(sseFrame("message_delta", {
+    type: "message_delta",
+    delta: { stop_reason: parsed.stop_reason ?? null, stop_sequence: parsed.stop_sequence ?? null },
+    usage: parsed.usage ?? {},
+  }));
+  events.push(sseFrame("message_stop", { type: "message_stop" }));
+  return events.join("\n\n") + "\n\n";
+}
+
+/**
+ * 娉ㄦ剰锛氳繖閲屽彧鏈変竴娆� fetch锛屾病鏈夊惊鐜€侀€€閬挎垨鑷姩閲嶈瘯銆�
+ * 鏂规 A锛氫笉鍐嶆帴鏀� / 浼犻€� AbortSignal锛堝幓鎺変簡 req.signal锛夛紝閬垮厤
+ * Deno.serve legacy 琛屼负涓� request.signal 鍦ㄥ搷搴旈€佽揪鍚庤Е鍙� abort銆�
+ * convertSse 妯″紡涓嬶細璇诲畬鏁� JSON -> 杞� SSE -> 鍥炵粰瀹㈡埛绔€�
  */
 async function forwardOnce(
   method: string,
@@ -577,6 +618,40 @@ async function forwardOnce(
   }
 
   const elapsed = Math.round(performance.now() - started);
+
+  if (meta.convertSse) {
+    // 涓婃父鎸� stream=false 杩斿洖瀹屾暣 JSON锛岃繖閲岃鍙栧悗杞垚 SSE 浜嬩欢娴�
+    let text = "";
+    try {
+      text = await new Response(upstream.body).text();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      record(`${meta.head}\n  attempt=1 convert-read-error=${message}`, true);
+      return json({ error: `upstream read error: ${message}` }, 502, meta.id);
+    }
+    const input = readUsage(text, "input_tokens");
+    const usage = [
+      `attempt=1`,
+      `status=${upstream.status}`,
+      `ms=${elapsed}`,
+      `len=${text.length}`,
+      `read=${readUsage(text, "cache_read_input_tokens")}`,
+      `create=${readUsage(text, "cache_creation_input_tokens")}`,
+      `w1h=${readUsage(text, "ephemeral_1h_input_tokens")}`,
+      `w5m=${readUsage(text, "ephemeral_5m_input_tokens")}`,
+      `in=${input}`,
+      `out=${readUsage(text, "output_tokens")}`,
+    ].join(" ");
+    const raw = !upstream.ok || input === "-"
+      ? `\n  RAW ct=${upstream.headers.get("content-type") ?? "-"} <${text.slice(0, 600).replace(/\s+/g, " ")}>`
+      : "";
+    record(`${meta.head}\n  ${usage}${raw}`, !upstream.ok);
+
+    const out = responseHeaders(upstream.headers, meta.id);
+    out.set("content-type", "text/event-stream; charset=utf-8");
+    return new Response(toSse(text), { status: upstream.status, headers: out });
+  }
+
   const out = responseHeaders(upstream.headers, meta.id);
 
   if (!upstream.body) {
@@ -630,7 +705,7 @@ async function handler(req: Request): Promise<Response> {
     const supplied = req.headers.get("x-proxy-token") || url.searchParams.get("proxy_token") || "";
     if (!safeEqual(supplied, PROXY_TOKEN)) return json({ error: "unauthorized" }, 401);
   }
-  // 允许浏览器用 ?proxy_token=... 查看诊断页，但绝不把令牌转发给上游。
+  // 鍏佽娴忚鍣ㄧ敤 ?proxy_token=... 鏌ョ湅璇婃柇椤碉紝浣嗙粷涓嶆妸浠ょ墝杞彂缁欎笂娓搞€�
   url.searchParams.delete("proxy_token");
 
   if (req.method === "GET" && (path === "/" || path === "/health")) {
@@ -643,6 +718,7 @@ async function handler(req: Request): Promise<Response> {
       tailBreakpoints: TAIL_BREAKPOINTS,
       currentTimeInjection: TIME_ENABLED,
       timeZone: TIME_ZONE,
+      forceNonStream: FORCE_NON_STREAM,
       upstreamAttemptsPerIncomingRequest: 1,
       logsInThisInstance: LOG_LINES.length,
     });
@@ -650,14 +726,14 @@ async function handler(req: Request): Promise<Response> {
 
   if (req.method === "GET" && path === "/logs") {
     return new Response(
-      LOG_LINES.length === 0 ? "暂无记录。" : LOG_LINES.join("\n\n"),
+      LOG_LINES.length === 0 ? "鏆傛棤璁板綍銆�" : LOG_LINES.join("\n\n"),
       { headers: { ...CORS_HEADERS, "content-type": "text/plain; charset=utf-8" } },
     );
   }
 
   if ((req.method === "GET" || req.method === "POST") && path === "/logs/clear") {
     LOG_LINES.length = 0;
-    return new Response("已清空", {
+    return new Response("宸叉竻绌�", {
       headers: { ...CORS_HEADERS, "content-type": "text/plain; charset=utf-8" },
     });
   }
@@ -707,8 +783,8 @@ async function handler(req: Request): Promise<Response> {
       ? `skipped(${result.skipped}) applied[${result.applied.join(" ")}]`
       : `applied[${result.applied.join(" ")}]`;
 
-    // 只要缓存功能开启，Anthropic 原生路径就始终补 beta。
-    // 不能只在 body 发生变化时补，否则“请求原本已经是 1h”时会漏头。
+    // 鍙缂撳瓨鍔熻兘寮€鍚紝Anthropic 鍘熺敓璺緞灏卞缁堣ˉ beta銆�
+    // 涓嶈兘鍙湪 body 鍙戠敓鍙樺寲鏃惰ˉ锛屽惁鍒�"璇锋眰鍘熸湰宸茬粡鏄� 1h"鏃朵細婕忓ご銆�
     if (isMessagesPath(path)) {
       headers.set("anthropic-beta", mergeBetaHeader(headers.get("anthropic-beta")));
     }
@@ -718,6 +794,15 @@ async function handler(req: Request): Promise<Response> {
   if (TIME_ENABLED && isMessagesPath(path)) {
     const result = appendCurrentTime(body);
     timeNote = result.added ? "added-after-cache" : `skipped(${result.reason})`;
+  }
+
+  // v2锛氬己鍒堕潪娴佸紡锛堜粎 Anthropic messages 璺緞 + 鍏ョ珯涓烘祦寮忔椂锛�
+  let streamNote = "passthrough";
+  let convertSse = false;
+  if (FORCE_NON_STREAM && isMessagesPath(path) && body?.stream === true) {
+    body.stream = false;
+    streamNote = "forced-false+sse";
+    convertSse = true;
   }
 
   headers.set("content-type", "application/json");
@@ -734,6 +819,7 @@ async function handler(req: Request): Promise<Response> {
     `mh=${messageHashes(body)}`,
     `msgs=${messageCount}:${rolesOf(body)}`,
     `stream=${body?.stream === true}`,
+    `force=${streamNote}`,
     `bpIn=${bpIn}`,
     `bpOut=${scanBreakpoints(body)}`,
     `cache=${cacheNote}`,
@@ -748,7 +834,7 @@ async function handler(req: Request): Promise<Response> {
     target,
     headers,
     JSON.stringify(body),
-    { id, head, path },
+    { id, head, path, convertSse },
   );
 }
 
